@@ -683,3 +683,32 @@ To close a PR without merging in the UI: open the PR → Conversation tab → bo
 - `Dockerfile`, `.dockerignore`, `next.config.ts` (`output: "standalone"`) and `k8s/` must be committed.
 - `app.yaml` must say `image: agentic-ai-demo:dev`.
 - The Playwright tests must match the app (the "Clear everything" rename), or `e2e` fails first and `kind-e2e` never runs.
+
+## Lab 11 – Code coverage in the pipeline
+
+**Goal reached:** every PR runs a `coverage` job (parallel to `e2e`) that measures how much of `src/` the Playwright suite executes, writes an HTML + lcov report, and fails when coverage drops below 80% lines / 80% functions / 70% branches. Current numbers: **100%** across the board (the suite exercises all of `page.tsx`).
+
+### How it works, command by command
+
+- `npm i -D monocart-reporter cross-env` — the reporter that aggregates coverage, and `cross-env` so `COVERAGE=1` works the same in PowerShell and on the Linux runner.
+- `next.config.ts` → `productionBrowserSourceMaps: process.env.COVERAGE === "1"` — emits `*.js.map` for the browser bundles **only** on the coverage build, so the minified chunks map back to `page.tsx`. Normal prod builds stay lean.
+- `tests/fixtures.ts` → `autoCoverage` auto-fixture — `page.coverage.startJSCoverage({ resetOnNavigation: false })` before the test, `addCoverageReport(await page.coverage.stopJSCoverage(), test.info())` after. `taskBoard` depends on `autoCoverage` so coverage starts **before** the first `goto`.
+- `playwright.config.ts` → monocart reporter under `COVERAGE=1`, with `entryFilter` (keep `/_next/` bundles) and `sourceFilter` (keep `/src/`, drop `node_modules`), reports `v8` (HTML), `console-summary`, `lcovonly`, `json-summary`.
+- `scripts/check-coverage.mjs` — reads `coverage/coverage-summary.json` and `process.exit(1)` if any metric is below threshold.
+- `package.json` → `"test:coverage": "cross-env COVERAGE=1 playwright test && node scripts/check-coverage.mjs"` — the `&&` means the gate runs only after a green suite; a red suite already exits non-zero.
+- CI `coverage` job runs `npm run test:coverage` with `env: { COVERAGE: '1' }` and uploads `coverage/` as `coverage-report` under `if: ${{ !cancelled() }}`.
+
+### Four things that broke, and the fix
+
+1. **webServer timed out (60s).** The coverage build also emits source maps, so `npm run build && npm run start` ran past Playwright's default 60s on a slow machine → `Error: Timed out waiting 60000ms from config.webServer`, status `failed`, 0 tests. Fix: `webServer.timeout: 120_000`.
+2. **Coverage reported 0% even though 14 V8 entries were collected.** The resolved source path is `turbopack:///[project]/src/app/page.tsx`, so `sourceFilter: p => p.startsWith('src/')` filtered everything out. Fix: `/\/src\//.test(p) && !p.includes('node_modules')` (the `node_modules/next/src/...` paths also contain `/src/`, hence the exclude).
+3. **`sourceMappingURL` points to a differently-named file.** Turbopack chunk `3fo9tww-ukfd5.js` ends with `//# sourceMappingURL=3psqavw0b0iu6.js.map`. Guessing `<chunk>.js.map` 404s; follow the actual `sourceMappingURL` (monocart does this automatically). Not a bug, just confusing while debugging.
+4. **Thresholds didn't fail the run.** monocart's `coverage.thresholds` only colors the HTML, and `process.exitCode = 1` set inside an `onEnd` hook was reset by Playwright (run exited 0 at `lines: 101`). Fix: the standalone `check-coverage.mjs` gate in the npm script. Verified: single test → functions 66.66% → exit 1; full suite → 100% → exit 0.
+
+### Debugging note
+
+Playwright captures stdout/stderr **inside fixtures** and only shows it on failure, so `console.log`/`process.stderr.write` in a fixture prints nothing. To inspect the raw V8 entries I wrote them to a file from the fixture (`fs.writeFileSync`), which bypasses the capture. Removed once the filters were right.
+
+### What e2e coverage does and doesn't measure
+
+It counts the client-side code Chromium runs, mapped to `src/`. It does **not** count server-only code (the `/healthz` route object isn't in the browser bundle). Treat 100% here as "our e2e journeys touch every line of the UI component", not "everything is tested". Only tests that `import { test } from '../fixtures'` are measured; `smoke.spec.ts` and `seed.spec.ts` import from `@playwright/test` directly, so they run but don't contribute coverage.

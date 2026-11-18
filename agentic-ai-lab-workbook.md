@@ -4,7 +4,7 @@ Nov 11, 2026 · @Zohrab
 
 ## How to use this workbook
 
-You will build the whole pipeline yourself, on your own app in `C:\Workspace\agentic-ai-demo`, across 11 labs and a capstone. By the end, every push runs Playwright tests in GitHub Actions, AI agents plan, generate and heal those tests, and the app is built into a container and deployed to a Kind (Kubernetes in Docker) cluster before the tests run against it.
+You will build the whole pipeline yourself, on your own app in `C:\Workspace\agentic-ai-demo`, across 12 labs and a capstone. By the end, every push runs Playwright tests in GitHub Actions, AI agents plan, generate and heal those tests, code coverage is measured and gated, and the app is built into a container and deployed to a Kind (Kubernetes in Docker) cluster before the tests run against it.
 
 **Every lab has the same parts:**
 
@@ -28,6 +28,7 @@ You will build the whole pipeline yourself, on your own app in `C:\Workspace\age
 flowchart LR
   dev[Developer<br/>VS Code + agents] -->|push| pr[Pull request]
   pr --> build[build] --> e2e[e2e<br/>Playwright]
+  build --> cov[coverage<br/>V8 + monocart]
   e2e -->|pass| kind[kind-e2e<br/>deploy + test]
   e2e -->|fail| heal[heal<br/>healer agent]
   pr -->|ai-tests label| gen[generate<br/>planner + generator]
@@ -742,6 +743,75 @@ $env:BASE_URL='http://localhost:8080'; npx playwright test
 
 **Stretch:** after `publish`, pull the GHCR image into a fresh Kind cluster on your laptop (`kubectl create secret docker-registry` if the package is private) to prove the published image runs. Or install Argo CD into Kind and have it deploy `:main` automatically.
 
+## Lab 11 – Code coverage in the pipeline
+
+**Goal:** every PR reports how much of your application code the e2e suite actually runs, as an HTML + lcov report you can download, and the pipeline fails when coverage drops below a threshold you choose.
+
+**Learn:**
+
+- **Two ways to measure coverage.** *Instrumentation* (Istanbul via Babel) rewrites your source to count lines, but it fights this project's Turbopack/SWC build. *Runtime V8 coverage* asks Chromium, which already tracks every line it runs, for the counts after the fact. V8 needs no build changes, so it is the right fit here.
+- **How the pieces connect.** Playwright reads V8 coverage from the browser through `page.coverage`. [`monocart-reporter`](https://github.com/cenfun/monocart-reporter) collects it per test, merges every test, and maps the browser bundle back to your TypeScript using **source maps**. Next emits those browser source maps only when you ask (`productionBrowserSourceMaps`), so you turn them on just for the coverage build.
+- **What e2e coverage does and doesn't tell you.** It measures the code a *user's* clicks exercise, which is a different, complementary signal to unit-test coverage. It counts the client-side code Chromium runs; server-only code (for example the `/healthz` route) isn't counted by this method. Treat the number as "how much of the UI do our journeys touch", not "how tested is everything".
+- **Filters.** `entryFilter` picks which browser bundles count (the app's `/_next/` chunks); `sourceFilter` then picks which *resolved* sources to report. After source-map resolution the paths look like `turbopack:///[project]/src/app/page.tsx`, **not** `src/app/page.tsx`, so match on `/src/` and exclude `node_modules` rather than `startsWith('src/')` — getting this wrong silently reports 0%.
+- **Thresholds don't gate by themselves.** monocart's `thresholds` only *color* the HTML report; they do not fail the run, and `process.exitCode` set from a reporter hook doesn't survive. So write the numbers to a JSON summary and enforce them in a tiny script that the `test:coverage` command runs after the suite. That script is what turns coverage red in CI.
+
+**Steps**
+
+1. Install the reporter and a cross-platform way to set an env var: `npm i -D monocart-reporter cross-env`.
+2. Emit browser source maps for the coverage build only. In `next.config.ts`:
+
+```ts
+productionBrowserSourceMaps: process.env.COVERAGE === "1",
+```
+
+3. Collect coverage around every test with an automatic fixture. In `tests/fixtures.ts`, add an `autoCoverage` fixture with `{ auto: true }` that, when `COVERAGE=1` and the browser is Chromium, calls `page.coverage.startJSCoverage({ resetOnNavigation: false })` before the test and `addCoverageReport(await page.coverage.stopJSCoverage(), test.info())` after it. When coverage is off it does nothing, so your normal e2e runs are unchanged.
+4. Add the reporter and its coverage config in `playwright.config.ts`, switched on only under `COVERAGE=1`. Include `json-summary` so the gate script has numbers to read:
+
+```ts
+const collectCoverage = process.env.COVERAGE === '1';
+const reporters = [['html', { open: 'never' }]];
+if (collectCoverage) {
+  reporters.push(['monocart-reporter', {
+    name: 'Agentic AI Demo – Coverage',
+    outputFile: './coverage/index.html',
+    coverage: {
+      entryFilter: (e) => e.url.includes('/_next/'),
+      // Resolved paths look like turbopack:///[project]/src/app/page.tsx
+      sourceFilter: (p) => /\/src\//.test(p) && !p.includes('node_modules'),
+      reports: [['v8'], ['console-summary'], ['lcovonly'], ['json-summary']],
+      outputDir: './coverage',
+      thresholds: { lines: 80, functions: 80, branches: 70 }, // colors the report only
+    },
+  }]);
+}
+// ... reporter: reporters
+```
+
+5. Give the build + start extra time, since the coverage build also emits source maps. In the `webServer` block of the same file: `timeout: 120_000` (the default is 60s).
+6. Write the gate. Create `scripts/check-coverage.mjs` that reads `coverage/coverage-summary.json`, compares `total.lines/functions/branches .pct` against your thresholds, prints each shortfall and `process.exit(1)` if any fail. Then wire it into `package.json` so it runs only after a green suite:
+
+```json
+"test": "playwright test",
+"test:coverage": "cross-env COVERAGE=1 playwright test && node scripts/check-coverage.mjs"
+```
+
+7. Run it locally: `npm run test:coverage`, then open `coverage/index.html`. Read the per-file lines and find a red (unexecuted) branch. Note that any test that should count toward coverage must import `test` from `../fixtures` (the `autoCoverage` fixture lives there).
+8. Add a `coverage` job to `ci.yml`, parallel to `e2e` (both `needs: build`), with `env: { COVERAGE: '1' }`. Reuse the e2e job's Playwright browser-cache steps, run `npm run test:coverage` (so the gate runs), then upload `coverage/` with `actions/upload-artifact` as `coverage-report` under `if: ${{ !cancelled() }}` so you still get the report on a failed gate.
+9. Open a PR and watch the `coverage` check run beside `e2e`. Download the `coverage-report` artifact and open the HTML.
+
+Your `coverage/index.html` should look like this — each `src/` file with its line, branch and function coverage, drillable to the exact lines a test did or didn't run:
+
+![Code coverage HTML report: the Playwright suite covers 100% of src/app/page.tsx](docs/images/coverage-report.png)
+
+**Checkpoint**
+
+- [ ] `npm run test:coverage` writes `coverage/index.html` + `coverage-summary.json` and prints a console summary of lines/functions/branches
+- [ ] The report lists `src/app/page.tsx` with real line numbers (source maps are working), not a minified `_next` chunk
+- [ ] Deleting one test (say the Clear-all tests) drops the number and makes `node scripts/check-coverage.mjs` exit non-zero; restoring it passes — you have proved the gate works
+- [ ] A PR shows a `coverage` check and a downloadable `coverage-report` artifact
+
+**Stretch:** post the coverage summary as a PR comment (monocart can emit markdown); add `coverage` to the required checks on `main`; find one uncovered branch and either add a test that hits it or justify in `LEARNING.md` why it is acceptable; measure the server routes separately with Next's instrumentation if you want server-side numbers too.
+
 ## Capstone and grading rubric
 
 The capstone is complete when a single feature PR goes through the whole pipeline without you touching a test by hand, and you can explain every step. Score 80 out of 100 or more to pass.
@@ -750,7 +820,7 @@ The capstone is complete when a single feature PR goes through the whole pipelin
 
 1. Change the UI so that at least one existing test breaks (for example, rename or restructure the screen).
 2. Add the `ai-tests` label.
-3. Let CI run: the e2e tests fail, the healer commits, the generator adds tests for the new feature, and `kind-e2e` passes.
+3. Let CI run: the e2e tests fail, the healer commits, the generator adds tests for the new feature, the `coverage` job stays above its thresholds, and `kind-e2e` passes.
 4. Review the AI commits against your healing policy, fix anything you reject, merge, and confirm the new image is in GHCR.
 5. Record a 5-minute walkthrough (screen recording or written) of the PR timeline, explaining each job and each AI commit.
 

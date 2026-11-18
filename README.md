@@ -40,12 +40,14 @@ flowchart LR
     subgraph CI["GitHub Actions: ci.yml (every PR)"]
         direction LR
         build["build<br/>npm ci + next build"] --> e2e["e2e<br/>Playwright vs npm start"]
+        build --> coverage["coverage<br/>V8 + monocart<br/>gated thresholds"]
         e2e --> kind["kind-e2e<br/>Docker image → Kind cluster<br/>Playwright vs deployed app"]
         e2e -. "fails" .-> heal["heal<br/>AI fixes outdated tests"]
     end
 
     pr --> build
     kind --> gate{"Required checks<br/>build · e2e · kind-e2e<br/>all green?"}
+    coverage -.-> gate
     gate -- no --> blocked["Merge blocked"]
     gate -- yes --> review["Human review<br/>+ merge"]
     review --> main[(main)]
@@ -64,11 +66,12 @@ flowchart LR
 1. **Branch and pull request.** All work happens on a branch. The `protect-main` ruleset blocks direct pushes, force pushes and deletion of `main`, so every change reaches it through a PR.
 2. **`build`.** `npm ci` and `next build` on a fresh Ubuntu runner. It catches compile and type errors.
 3. **`e2e`.** The full Playwright suite runs against the app started with `npm start`. It checks user-visible behavior.
-4. **`kind-e2e`.** The job builds the **Docker image** tagged with the commit SHA and creates a **Kind** (Kubernetes in Docker) cluster on the runner. It loads the image, deploys it with the Kubernetes manifests in `k8s/` and waits for the readiness probes, then runs the same Playwright suite against the **deployed** app. This catches problems `e2e` can't see: a wrong port, a failing probe, a broken image or a bad manifest.
-5. **`heal` (only if `e2e` fails).** An AI agent decides whether the tests are out of date or the app is broken. It fixes outdated tests on the PR branch, or stops and reports a real bug.
-6. **Required checks.** `build`, `e2e` and `kind-e2e` are required status checks. The Merge button stays blocked until all three are green.
-7. **Human review and merge.** A person reviews the code and any AI commits, then merges.
-8. **`publish` (only on `main`).** After the merge, the pipeline runs again on `main`. Once `kind-e2e` passes, the image is pushed to GHCR under two tags: the commit SHA (permanent, for exact deploys and rollbacks) and `main` (always the newest).
+4. **`coverage`.** In parallel with `e2e`, the suite runs once more with `COVERAGE=1`. The app is built with browser source maps, Playwright collects V8 coverage from Chromium, and `monocart-reporter` maps it back to `src/` and writes an HTML + lcov report (uploaded as the `coverage-report` artifact). The job fails if coverage drops below the thresholds in `playwright.config.ts`.
+5. **`kind-e2e`.** The job builds the **Docker image** tagged with the commit SHA and creates a **Kind** (Kubernetes in Docker) cluster on the runner. It loads the image, deploys it with the Kubernetes manifests in `k8s/` and waits for the readiness probes, then runs the same Playwright suite against the **deployed** app. This catches problems `e2e` can't see: a wrong port, a failing probe, a broken image or a bad manifest.
+6. **`heal` (only if `e2e` fails).** An AI agent decides whether the tests are out of date or the app is broken. It fixes outdated tests on the PR branch, or stops and reports a real bug.
+7. **Required checks.** `build`, `e2e` and `kind-e2e` are required status checks. The Merge button stays blocked until all three are green.
+8. **Human review and merge.** A person reviews the code and any AI commits, then merges.
+9. **`publish` (only on `main`).** After the merge, the pipeline runs again on `main`. Once `kind-e2e` passes, the image is pushed to GHCR under two tags: the commit SHA (permanent, for exact deploys and rollbacks) and `main` (always the newest).
 
 ### Skills this project demonstrates
 
@@ -232,7 +235,7 @@ sequenceDiagram
 │   └── free-shipping.md         #   sample requirements doc (not implemented in the app)
 ├── tests/
 │   ├── pages/task-board-page.ts # Page object: every locator lives here
-│   ├── fixtures.ts              # `taskBoard` fixture: opens a fresh board
+│   ├── fixtures.ts              # `taskBoard` fixture + autoCoverage (V8 coverage when COVERAGE=1)
 │   ├── feature/*.spec.ts        # 10 tests from specs/adding-task.md
 │   ├── clear-all/*.spec.ts      #  8 tests from specs/clear-all.md
 │   ├── smoke.spec.ts            # Smoke test
@@ -245,8 +248,8 @@ sequenceDiagram
 ├── .mcp.ci.json                 # Same server for Linux CI runners (`npx …`)
 ├── CLAUDE.md                    # Policy that every Claude session and subagent reads
 ├── docs/healing-policy.md       # Source of the healing policy
-├── next.config.ts               # Includes output: "standalone" for the Docker image
-├── playwright.config.ts
+├── next.config.ts               # output: "standalone"; browser source maps when COVERAGE=1
+├── playwright.config.ts         # Adds monocart coverage reporter under COVERAGE=1
 ├── LEARNING.md                  # Lab notes: decisions, run results, costs, lessons
 └── agentic-ai-lab-workbook.md   # The lab workbook this project follows
 ```
@@ -300,7 +303,7 @@ localhost:8080 → (Kind port mapping) node:30080 → (NodePort Service) Service
 
 ## CI/CD workflows
 
-### `ci.yml`: build → e2e → kind-e2e → publish, plus heal
+### `ci.yml`: build → e2e (+ coverage) → kind-e2e → publish, plus heal
 
 The workflow runs on every **pull request** and on every **push to `main`**. The same jobs run in both cases. Only `publish` is limited to `main`.
 
@@ -308,14 +311,19 @@ The workflow runs on every **pull request** and on every **push to `main`**. The
 |---|---|---|
 | `build` | every PR, push to `main` | `npm ci` + `npm run build` |
 | `e2e` | after `build` | Restores the cached browser, runs `npx playwright test` (Playwright starts the app through `webServer`), and uploads `playwright-report/` and `test-results/` (including `.last-run.json`) |
+| `coverage` | after `build` (parallel to `e2e`) | Runs the suite with `COVERAGE=1`: the app is built with browser source maps, Playwright collects V8 coverage, `monocart-reporter` maps it to `src/` and writes `coverage/` (HTML + lcov), uploaded as `coverage-report`. Fails below the thresholds in `playwright.config.ts`. |
 | `kind-e2e` | after `e2e` passes | Creates a Kind cluster (`helm/kind-action`), builds the image tagged with `github.sha`, `kind load`s it, deploys `k8s/app.yaml` with the tag swapped in, waits for `rollout status`, runs Playwright against `http://localhost:8080`. On failure, prints pods, events and logs. |
 | `publish` | after `kind-e2e`, **only** `if: github.ref == 'refs/heads/main'` | Logs in to `ghcr.io` with `GITHUB_TOKEN` (`permissions: packages: write`) and pushes `ghcr.io/zbasmajian/agentic-ai-demo:<sha>` and `:main`. Shows as *skipped* on PRs. |
 | `heal` | `e2e` failed **and** the event is a PR | Loop guard → install → download the e2e results → Claude runs the healer on `--last-failed` → full-suite check → `heal:` commit + PR comment |
 
+The `coverage` job's HTML report (downloadable as the `coverage-report` artifact, and viewable locally at `coverage/index.html` after `npm run test:coverage`) shows the V8 coverage mapped back to `src/`:
+
+![Code coverage HTML report: the Playwright suite covers 100% of src/app/page.tsx](docs/images/coverage-report.png)
+
 ### Branch protection (`protect-main` ruleset)
 
 - Changes reach `main` only through a pull request. Force pushes and branch deletion are blocked.
-- **Required status checks:** `build`, `e2e`, `kind-e2e`, each tied to GitHub Actions as the source. `heal` and `publish` are deliberately not required: `heal` is a helper, and `publish` never runs on PRs.
+- **Required status checks:** `build`, `e2e`, `kind-e2e`, each tied to GitHub Actions as the source. `heal` and `publish` are deliberately not required: `heal` is a helper, and `publish` never runs on PRs. `coverage` runs on every PR and reports its own pass/fail; add it to the required checks once your thresholds are stable (Lab 11).
 - `e2e` is required as well as `kind-e2e`, because a check skipped by a failed dependency would otherwise count as passing.
 
 ### `ai-generate-tests.yml`: label-triggered generation
@@ -426,6 +434,8 @@ npm run build && npm start
 
 npx playwright test    # runs the suite (starts the app via webServer if needed)
 npx playwright show-report
+
+npm run test:coverage  # same suite with V8 code coverage → coverage/index.html
 ```
 
 If the app is already running, point the tests at it and skip `webServer`:
@@ -503,6 +513,7 @@ The run summary of each Claude step shows the turns used and the cost (`num_turn
 - [x] Run e2e against the app deployed on a local Kind (Kubernetes in Docker) cluster
 - [x] A short-lived Kind cluster per PR in CI, then publish versioned images to GHCR on merge
 - [x] Required status checks (`build`, `e2e`, `kind-e2e`) in the `protect-main` ruleset
+- [x] Code coverage measured and gated in CI (Playwright V8 + monocart, mapped to `src/`)
 - [ ] `preStop` hook so rolling updates drop no requests while old pods shut down
 - [ ] Scan the image for vulnerabilities (for example Trivy) before publishing
 - [ ] Promote the exact tested image bytes from `kind-e2e` to `publish` instead of rebuilding
