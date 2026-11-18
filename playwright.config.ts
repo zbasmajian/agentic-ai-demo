@@ -1,5 +1,42 @@
-import { defineConfig, devices } from '@playwright/test';
+import { defineConfig, devices, type ReporterDescription } from '@playwright/test';
 const externalURL = process.env.BASE_URL;
+
+/**
+ * Code coverage (Lab 11). Set COVERAGE=1 to collect V8 JS coverage during the
+ * run and write an HTML + lcov report under ./coverage. The autoCoverage fixture
+ * in tests/fixtures.ts feeds monocart; monocart maps the browser bundle back to
+ * src/ via the source maps that next.config.ts emits under COVERAGE=1.
+ */
+const collectCoverage = process.env.COVERAGE === '1';
+
+// CI gate: minimum coverage of our src/ code. Tune in LEARNING.md as code grows.
+const COVERAGE_THRESHOLDS = { lines: 80, functions: 80, branches: 70 };
+
+const reporters: ReporterDescription[] = [['html', { open: 'never' }]];
+if (collectCoverage) {
+  reporters.push(['monocart-reporter', {
+    name: 'Agentic AI Demo – Coverage',
+    // Keep the monocart test report off coverage/index.html, which the v8 coverage
+    // report owns (both default to outputDir/index.html otherwise and collide).
+    outputFile: './coverage/test-report.html',
+    coverage: {
+      // Keep only the app's own browser bundles, then only src/ sources, so the
+      // numbers describe our code and not Next.js runtime or node_modules.
+      entryFilter: (entry: { url: string }) => entry.url.includes('/_next/'),
+      // Source-map paths look like turbopack:///[project]/src/app/page.tsx
+      // (or webpack://_N_E/./src/... on webpack). Keep our src/, drop deps.
+      sourceFilter: (path: string) => /\/src\//.test(path) && !path.includes('node_modules'),
+      // json-summary writes coverage/coverage-summary.json, which the gate in
+      // scripts/check-coverage.mjs reads. (monocart's own `thresholds` below only
+      // colors the HTML report; it does not fail the run, so the script enforces.)
+      // inline:true bundles the viewer into the HTML so the uploaded CI artifact
+      // is self-contained (no separate ./assets/ dir to commit or lose).
+      reports: [['v8', { inline: true }], ['console-summary'], ['lcovonly'], ['json-summary']],
+      outputDir: './coverage',
+      thresholds: COVERAGE_THRESHOLDS,
+    },
+  }]);
+}
 
 /**
  * Read environment variables from file.
@@ -29,7 +66,7 @@ export default defineConfig({
   timeout: 15_000,
   expect: { timeout: 5_000 },
   /* Reporter to use. See https://playwright.dev/docs/test-reporters */
-  reporter: 'html',
+  reporter: reporters,
   /* Shared settings for all the projects below. See https://playwright.dev/docs/api/class-testoptions. */
   use: {
     /* Base URL to use in actions like `await page.goto('')`. */
@@ -75,5 +112,8 @@ export default defineConfig({
      command: 'npm run build && npm run start',
      url: 'http://localhost:3000/healthz',
      reuseExistingServer: !process.env.CI,
+     // The coverage build (COVERAGE=1) also emits browser source maps, so give
+     // build + start extra headroom over Playwright's 60s default.
+     timeout: 120_000,
   }
 });

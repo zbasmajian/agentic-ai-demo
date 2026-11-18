@@ -45,6 +45,44 @@ jobs:
           retention-days: 7
           # test-results/.last-run.json (list of failed tests) is a hidden file; the healer needs it
           include-hidden-files: true
+  # Lab 11: measure how much of src/ the e2e suite exercises. Runs in parallel
+  # with e2e (both need only build). COVERAGE=1 makes next build emit browser
+  # source maps and makes the autoCoverage fixture collect V8 coverage; monocart
+  # writes an HTML + lcov report and fails the job if coverage drops below the
+  # thresholds in playwright.config.ts.
+  coverage:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env: { COVERAGE: '1' }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm }
+      - run: npm ci
+      - name: Cache Playwright browsers
+        id: pw-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+      - name: Install Playwright browser (cache miss)
+        if: steps.pw-cache.outputs.cache-hit != 'true'
+        run: npx playwright install --with-deps chromium
+      - name: Install browser system deps only (cache hit)
+        if: steps.pw-cache.outputs.cache-hit == 'true'
+        run: npx playwright install-deps chromium
+      # Runs the suite with coverage, then scripts/check-coverage.mjs fails the
+      # job if src/ coverage is below the thresholds. COVERAGE=1 comes from the env above.
+      - run: npm run test:coverage
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: coverage-report
+          path: coverage/
+          retention-days: 7
+
   heal:
     needs: e2e
     if: ${{ failure() && github.event_name == 'pull_request' }}
