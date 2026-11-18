@@ -684,6 +684,23 @@ To close a PR without merging in the UI: open the PR → Conversation tab → bo
 - `app.yaml` must say `image: agentic-ai-demo:dev`.
 - The Playwright tests must match the app (the "Clear everything" rename), or `e2e` fails first and `kind-e2e` never runs.
 
+### Why three test layers: `build`, `e2e`, `kind-e2e`
+
+They look redundant (`e2e` and `kind-e2e` run the *same* Playwright suite), but each runs it against a different artifact and catches what the others structurally can't. Each layer is slower and more realistic, and runs only after the cheaper one passes — fastest possible "no", most trustworthy "yes".
+
+| Job | Runs against | Speed | Answers |
+| --- | --- | --- | --- |
+| `build` | nothing (just compiles) | fastest | does it compile / type-check? |
+| `e2e` | the app via `npm start` | fast | does my **code** behave? |
+| `kind-e2e` | the **Docker image deployed to Kind** | slow | does the **shipped artifact** run in a prod-like cluster? |
+
+- **`build` first, cheap gate.** `next build` catches compile/type/import errors in seconds. If it fails, `e2e` and `kind-e2e` never start (`needs: build`), so I don't pay for a browser or a cluster to learn the code doesn't compile.
+- **`e2e` tests my logic, not my packaging.** `npm start` is *not* how the app runs in prod. A whole class of bugs lives only in the Docker + Kubernetes layer and is invisible to `npm start`: wrong files copied in the image, app listening on `localhost` instead of `0.0.0.0`, a readiness probe pointed at the wrong path, a missing env var in `app.yaml`, wrong `PORT`/NodePort, an OOM-killing resource limit.
+- **`kind-e2e` tests the real artifact.** It builds the image, loads it into a throwaway cluster, deploys it with the real `k8s/` manifests, waits for the probes, then runs the same tests against the deployed app on `:8080`. Proven by Lab 10 PR #14: a broken `/nope` readiness probe → `e2e` **passed**, `kind-e2e` **failed**, because only `kind-e2e` reads `app.yaml`.
+- **Why keep both instead of only `kind-e2e`?** Speed (e2e ~1 min vs kind-e2e several), and *isolating the cause*: `e2e` ✅ + `kind-e2e` ❌ means the bug is in packaging/deployment, not app code — the identical tests passed against `npm start`. That split is a free diagnostic I'd lose if I only ran `kind-e2e`.
+
+Short version: **build** = does it compile? **e2e** = does my code work? **kind-e2e** = does the deployed image work? Classic test-pyramid / progressive-delivery: cheap checks fail fast, the expensive high-fidelity check runs last. (`coverage` sits beside `e2e` on the same fast layer — both `needs: build` — because it only needs the app via `npm start`, not the deployed image.)
+
 ## Lab 11 – Code coverage in the pipeline
 
 **Goal reached:** every PR runs a `coverage` job (parallel to `e2e`) that measures how much of `src/` the Playwright suite executes, writes an HTML + lcov report, and fails when coverage drops below 80% lines / 80% functions / 70% branches. Current numbers: **100%** across the board (the suite exercises all of `page.tsx`).
