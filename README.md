@@ -16,6 +16,8 @@ The app is deliberately small (a Next.js "Sprint Task Board"), so the focus stay
 - [Capabilities](#capabilities)
 - [Architecture](#architecture)
 - [Repository layout](#repository-layout)
+- [Getting started](#getting-started)
+- [Setting up the AI workflows](#setting-up-the-ai-workflows)
 - [The app under test](#the-app-under-test)
 - [Containers and Kubernetes](#containers-and-kubernetes)
 - [CI/CD workflows](#cicd-workflows)
@@ -24,8 +26,6 @@ The app is deliberately small (a Next.js "Sprint Task Board"), so the focus stay
 - [Guardrails](#guardrails)
 - [Performance tuning](#performance-tuning)
 - [Results from real runs](#results-from-real-runs)
-- [Getting started](#getting-started)
-- [Setting up the AI workflows](#setting-up-the-ai-workflows)
 - [Roadmap](#roadmap)
 - [Further reading](#further-reading)
 
@@ -256,6 +256,89 @@ sequenceDiagram
 
 ---
 
+## Getting started
+
+**Prerequisites:** Node.js 22 and Git. For the container and Kubernetes loop: Docker, [kind](https://kind.sigs.k8s.io/) and kubectl. Optionally, [Claude Code](https://claude.com/claude-code) to run the agents locally.
+
+### Run and test the app
+
+```bash
+npm ci
+npx playwright install chromium
+
+npm run dev            # dev server on http://localhost:3000
+# or, production-like:
+npm run build && npm start
+
+npx playwright test    # runs the suite (starts the app via webServer if needed)
+npx playwright show-report
+
+npm run test:coverage  # same suite with V8 code coverage → coverage/index.html
+```
+
+If the app is already running, point the tests at it and skip `webServer`:
+
+```bash
+BASE_URL=http://localhost:3000 npx playwright test
+```
+
+### Run it in Docker
+
+```bash
+docker build -t agentic-ai-demo:dev .
+docker run --rm -p 3000:3000 agentic-ai-demo:dev
+```
+
+### Deploy it to a local Kubernetes cluster (Kind)
+
+```bash
+kind create cluster --name qa --config k8s/kind-config.yaml
+docker build -t agentic-ai-demo:dev .
+kind load docker-image agentic-ai-demo:dev --name qa
+kubectl apply -f k8s/app.yaml
+kubectl rollout status deployment/agentic-ai-demo --timeout=120s
+curl http://localhost:8080/healthz
+BASE_URL=http://localhost:8080 npx playwright test
+
+kind delete cluster --name qa   # clean up
+```
+
+### Pull the published image
+
+```bash
+docker pull ghcr.io/zbasmajian/agentic-ai-demo:main
+```
+
+The package is private by default. Log in first with `gh auth token | docker login ghcr.io -u <user> --password-stdin`, or make it public in the package settings.
+
+### Run the agents locally
+
+Open Claude Code in the repo. It picks up `.mcp.json` and `.claude/agents/`. Then ask, for example:
+
+- *"Use the playwright-test-planner to write a test plan for the Clear all button in specs/."*
+- *"Use the playwright-test-generator to write tests for specs/clear-all.md."*
+- *"Run the tests and use the playwright-test-healer to fix any failures."*
+
+`.mcp.json` uses `cmd /c npx …` for Windows. On macOS or Linux, use `.mcp.ci.json` (or edit the command to plain `npx`).
+
+---
+
+## Setting up the AI workflows
+
+1. **API key:** create one in the [Anthropic Console](https://console.anthropic.com) (Settings → API Keys; the account needs credits), then add it as a repository secret:
+   ```bash
+   gh secret set ANTHROPIC_API_KEY   # paste the key when prompted
+   ```
+   Or use GitHub: **Settings → Secrets and variables → Actions → New repository secret**. If the workflow log shows `ANTHROPIC_API_KEY:` with nothing after it, the secret is empty.
+2. **Label:** `gh label create ai-tests --color 5319E7`
+3. **Try healing:** open a PR that renames a button. Watch e2e go red, then the `heal:` commit, then green.
+4. **Try generation:** open a PR that adds a small feature and add the `ai-tests` label. Watch for the `test:` commit with a new spec and tests.
+5. **Review** every AI commit before merging.
+
+The run summary of each Claude step shows the turns used and the cost (`num_turns`, `total_cost_usd`).
+
+---
+
 ## The app under test
 
 A one-page Next.js 16 / React 19 app styled with Tailwind CSS:
@@ -415,89 +498,6 @@ A green run's test step takes about **15–20 s** in CI. A full PR pipeline (`bu
 | [#15](https://github.com/zbasmajian/agentic-ai-demo/pull/15): `publish` job | `ci.yml` | On the PR: `publish` skipped and the merge `BLOCKED` until `kind-e2e` passed. After the merge: `publish` pushed `ghcr.io/zbasmajian/agentic-ai-demo:<sha>` and `:main`. | – |
 
 The AI runs stayed inside policy. There were no edits to `src/` and no weakened assertions, and every change was explained in a PR comment. PR #14 shows why testing the deployed artifact matters: the plain e2e job called it green. See [`LEARNING.md`](LEARNING.md) for the full write-ups and lessons.
-
----
-
-## Getting started
-
-**Prerequisites:** Node.js 22 and Git. For the container and Kubernetes loop: Docker, [kind](https://kind.sigs.k8s.io/) and kubectl. Optionally, [Claude Code](https://claude.com/claude-code) to run the agents locally.
-
-### Run and test the app
-
-```bash
-npm ci
-npx playwright install chromium
-
-npm run dev            # dev server on http://localhost:3000
-# or, production-like:
-npm run build && npm start
-
-npx playwright test    # runs the suite (starts the app via webServer if needed)
-npx playwright show-report
-
-npm run test:coverage  # same suite with V8 code coverage → coverage/index.html
-```
-
-If the app is already running, point the tests at it and skip `webServer`:
-
-```bash
-BASE_URL=http://localhost:3000 npx playwright test
-```
-
-### Run it in Docker
-
-```bash
-docker build -t agentic-ai-demo:dev .
-docker run --rm -p 3000:3000 agentic-ai-demo:dev
-```
-
-### Deploy it to a local Kubernetes cluster (Kind)
-
-```bash
-kind create cluster --name qa --config k8s/kind-config.yaml
-docker build -t agentic-ai-demo:dev .
-kind load docker-image agentic-ai-demo:dev --name qa
-kubectl apply -f k8s/app.yaml
-kubectl rollout status deployment/agentic-ai-demo --timeout=120s
-curl http://localhost:8080/healthz
-BASE_URL=http://localhost:8080 npx playwright test
-
-kind delete cluster --name qa   # clean up
-```
-
-### Pull the published image
-
-```bash
-docker pull ghcr.io/zbasmajian/agentic-ai-demo:main
-```
-
-The package is private by default. Log in first with `gh auth token | docker login ghcr.io -u <user> --password-stdin`, or make it public in the package settings.
-
-### Run the agents locally
-
-Open Claude Code in the repo. It picks up `.mcp.json` and `.claude/agents/`. Then ask, for example:
-
-- *"Use the playwright-test-planner to write a test plan for the Clear all button in specs/."*
-- *"Use the playwright-test-generator to write tests for specs/clear-all.md."*
-- *"Run the tests and use the playwright-test-healer to fix any failures."*
-
-`.mcp.json` uses `cmd /c npx …` for Windows. On macOS or Linux, use `.mcp.ci.json` (or edit the command to plain `npx`).
-
----
-
-## Setting up the AI workflows
-
-1. **API key:** create one in the [Anthropic Console](https://console.anthropic.com) (Settings → API Keys; the account needs credits), then add it as a repository secret:
-   ```bash
-   gh secret set ANTHROPIC_API_KEY   # paste the key when prompted
-   ```
-   Or use GitHub: **Settings → Secrets and variables → Actions → New repository secret**. If the workflow log shows `ANTHROPIC_API_KEY:` with nothing after it, the secret is empty.
-2. **Label:** `gh label create ai-tests --color 5319E7`
-3. **Try healing:** open a PR that renames a button. Watch e2e go red, then the `heal:` commit, then green.
-4. **Try generation:** open a PR that adds a small feature and add the `ai-tests` label. Watch for the `test:` commit with a new spec and tests.
-5. **Review** every AI commit before merging.
-
-The run summary of each Claude step shows the turns used and the cost (`num_turns`, `total_cost_usd`).
 
 ---
 
